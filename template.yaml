@@ -1,0 +1,63 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Plantilla DevOps - Despliega una instancia EC2 t2.micro con el perfil
+  LabInstanceProfile y un bucket S3 con versionado habilitado.
+
+Parameters:
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI Amazon Linux 2023 obtenida del SSM Parameter Store.
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro, t3.micro]
+    Description: Tipo de instancia EC2 (mantener bajo costo en Learner Lab).
+
+Resources:
+  DevopsEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: LabInstanceProfile
+      Tags:
+        - Key: Name
+          Value: devops-ec2
+        - Key: Proyecto
+          Value: DevOps-LearnerLab
+
+  DevopsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "devops-bucket-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Proyecto
+          Value: DevOps-LearnerLab
+
+Outputs:
+  InstanceId:
+    Description: ID de la instancia EC2 creada.
+    Value: !Ref DevopsEC2
+    Export:
+      Name: devops-instance-id
+
+  BucketName:
+    Description: Nombre del bucket S3 creado.
+    Value: !Ref DevopsBucket
+    Export:
+      Name: devops-bucket-name
