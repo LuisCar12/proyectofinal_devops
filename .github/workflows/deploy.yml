@@ -1,0 +1,116 @@
+name: CI/CD DevOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET_PREFIX: devops-bucket
+  EC2_TAG_NAME: devops-ec2
+
+jobs:
+  test:
+    name: Test - Validar aplicacion Flask
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        working-directory: docker
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verificar que la app Flask se importa
+        working-directory: docker
+        run: |
+          python -c "import app; assert hasattr(app, 'app'), 'Flask app no encontrada'; print('OK: app.py importa correctamente')"
+
+  deploy:
+    name: Deploy - Subir a S3 y desplegar en EC2
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Empaquetar aplicacion
+        run: |
+          cd docker
+          zip -r ../app-${{ github.sha }}.zip app.py requirements.txt Dockerfile docker-compose.yml nginx.conf
+          cd ..
+          ls -la app-*.zip
+
+      - name: Detectar bucket S3 del proyecto
+        id: bucket
+        run: |
+          BUCKET=$(aws s3 ls | awk '{print $3}' | grep "^${S3_BUCKET_PREFIX}" | head -n1)
+          if [ -z "$BUCKET" ]; then
+            echo "ERROR: no se encontro un bucket con prefijo ${S3_BUCKET_PREFIX}"
+            exit 1
+          fi
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "Bucket detectado: $BUCKET"
+
+      - name: Subir paquete a S3
+        run: |
+          aws s3 cp app-${{ github.sha }}.zip \
+            s3://${{ steps.bucket.outputs.bucket }}/releases/app-${{ github.sha }}.zip
+          aws s3 cp app-${{ github.sha }}.zip \
+            s3://${{ steps.bucket.outputs.bucket }}/releases/app-latest.zip
+
+      - name: Detectar instancia EC2 destino
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${EC2_TAG_NAME}" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "WARNING: no se encontro EC2 con tag Name=${EC2_TAG_NAME}, saltando deploy SSM."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Instancia detectada: $INSTANCE_ID"
+          fi
+
+      - name: Desplegar en EC2 via SSM
+        if: steps.ec2.outputs.skip == 'false'
+        run: |
+          BUCKET="${{ steps.bucket.outputs.bucket }}"
+          SHA="${{ github.sha }}"
+          aws ssm send-command \
+            --instance-ids "${{ steps.ec2.outputs.instance_id }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy DevOps build ${SHA}" \
+            --parameters "commands=[
+              \"set -e\",
+              \"mkdir -p /opt/devops-app && cd /opt/devops-app\",
+              \"aws s3 cp s3://${BUCKET}/releases/app-latest.zip ./app.zip\",
+              \"unzip -o app.zip\",
+              \"echo 'Despliegue completado: ${SHA}' > /opt/devops-app/last_deploy.txt\"
+            ]"
+
+      - name: Resumen del despliegue
+        run: |
+          echo "Build SHA: ${{ github.sha }}"
+          echo "Bucket: ${{ steps.bucket.outputs.bucket }}"
+          echo "Deploy SSM: ${{ steps.ec2.outputs.skip == 'false' && 'ejecutado' || 'omitido (sin EC2)' }}"
